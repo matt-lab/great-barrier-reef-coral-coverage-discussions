@@ -1,6 +1,6 @@
 # Licenses
 
-All software and documentation is licensed with a MIT license. For all other writing (e.g., the Q sort statements in the *study2* file) and the data files, the copyright and related rights are waived via CC0.
+All software and documentation is licensed with a MIT license. For all other writing (e.g., the figures), the copyright and related rights are waived via CC0.
 
 ## MIT License
 
