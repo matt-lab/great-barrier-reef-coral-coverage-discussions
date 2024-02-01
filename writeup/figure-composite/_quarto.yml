@@ -1,0 +1,16 @@
+execute:
+  echo: false
+  warning: false
+from: markdown+emoji
+format:
+  html:
+    self-contained: true
+    code-fold: true
+    fig-width: 8
+    fig-height: 6
+always_allow_html: true
+toc: true
+toc-depth: 2
+theme: cosmo   # cosmo bootswatch theme
+project:
+  execute-dir: project

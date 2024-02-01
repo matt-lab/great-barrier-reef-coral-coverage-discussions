@@ -1,0 +1,603 @@
+---
+title: "Composite Figure for Policy Forum"
+---
+
+```{r}
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(ggforce)
+library(ggpubr)
+library(gt)
+library(stm)
+library(mgcv)
+
+
+# Load data
+load("../../out/interim/twitter_analysis_full.Rdata")
+
+# Recode key variables
+data <- data |>
+    mutate(is_retweet = !(tweet_id %in% data_unique_tweets$tweet_id))
+# Nest for convenience, such that each row is a unique tweet or retweet
+data <- data |>
+    group_by(tweet_id) |>
+    nest(type = c(tweet_id_typed, type)) |>
+    ungroup()
+data_twitter <- data |>
+    mutate(time_start = parse_date_time("2022-08-03T14:00:00Z", "YmdHMS")) |>
+    mutate(day = interval(time_start, created_at) / ddays(1))
+
+rm(list = setdiff(ls(), list("data_twitter", "stm_results", "data_words")))
+```
+
+```{r}
+next_odd <- function(x) {
+    # If x is even, make it the next odd number
+    x + ((x - 1) %% 2)
+}
+specify_decimal <- function(x, k = 2) trimws(format(round(x, k), nsmall=k))
+running_average <- function(scores, window = 7) {
+    # Calculate the running average of a vector
+    # scores: vector
+    # window: number of days to average over
+    # returns: vector of same length as x
+    window <- next_odd(window)
+    tibble(scores) |>
+        mutate(has_window = c(
+            rep(NA, floor(window / 2)),
+            rep(TRUE, length(scores) - window + 1),
+            rep(NA, floor(window / 2))
+        )) |>
+        mutate(sum_scores = cumsum(scores)) |>
+        mutate(sum_scores_lag = lag(
+            sum_scores,
+            ceiling(window / 2),
+            default = 0
+        )) |>
+        mutate(sum_scores_lead = lead(
+            sum_scores,
+            floor(window / 2)
+        )) |>
+        mutate(running_sum = sum_scores_lead - sum_scores_lag) |>
+        mutate(running_average = case_when(
+            has_window ~ running_sum / window,
+            TRUE ~ NA_real_
+        )) |>
+        pull(running_average)
+}
+clean_tweets <- function(text) {
+    # Clean whitespace
+    text <- text |>
+        str_replace_all("[:blank:]+", " ") |>
+        str_remove_all("^[:blank:]") |>
+        str_remove_all("[:blank:]$")
+    # Remove usernames at beginning of tweet
+    text <- text |>
+        str_remove_all("^(@[:graph:]+[:blank:]+)+") |>
+        str_replace_all("@[:graph:]+[:blank:]+", "@username ") |>
+        str_replace_all("@[:graph:]+$", "@username")
+    # Remove links
+    text <- str_replace_all(text, "https://t.co/[A-Za-z0-9]+", "")
+    return(text)
+}
+```
+
+```{r}
+load("../../out/interim/media_analysis_full.RData")
+# Change codes to have consistent tense
+data_media <- data |>
+    mutate(code = ifelse(code == "qualified_recovery", "qualifies_recovery", code))
+# wide data
+data_media_wide <- data_media |>
+    pivot_wider(names_from = code, values_from = code_present)
+```
+
+```{r}
+# Set consistent plot themes
+palette_media_two <- c("#F0E442", "#0072B2")
+palette_gray_two <- c("#bebebe", "#2c2c2c")
+palette_gray_two_bold <- c("#a2a2a2", "#101010")
+palette_off_white <- "#f3f3f3"
+```
+
+
+```{r}
+#| label: fig-media
+#| fig-cap: Breakdown of frames in Great Barrier Reef media articles. Compared to articles that avoided foregrounding reef recovery (light grey), articles that foreground recovery (dark grey) are more likely to avoid qualifying recovery with details, are more likely to inaccurately reflect science, and more likely to present content sceptical of anthropogenic climate change.
+
+# Media stream plot
+
+# Text for display
+media_display_text <- tibble(
+    x_text = c(
+            "foregrounds_recovery",
+            "qualifies_recovery",
+            "accurately_reflects_science",
+            "climate_scepticism"),
+    x = seq(1, length(x_text)),
+    yes = x_text,
+    no = str_c("does_not_", x_text)
+)
+media_display_text <- media_display_text |>
+    mutate(no = str_replace_all(no, "foregrounds", "foreground")) |>
+    mutate(no = str_replace_all(no, "qualifies", "qualify")) |>
+    mutate(no = str_replace_all(no, "reflects", "reflect")) |>
+    mutate(yes = ifelse(x_text == "climate_scepticism", "sceptical_of_climate_change", yes)) |>
+    mutate(no = ifelse(x_text == "climate_scepticism", "not_sceptical_of_climate_change", no))
+media_display_text <- media_display_text |>
+    pivot_longer(cols = c("yes", "no"), names_to = "y_english", values_to = "y_text") |>
+    mutate(y_order = c(2, 1, 3, 4, 5, 6, 8, 7))
+
+# Data
+data_media_stream <- data_media_wide |>
+    select(-headline_qualifies_recovery, -identified_political_nature) |>
+    group_by(
+        foregrounds_recovery, 
+        qualifies_recovery,
+        accurately_reflects_science,
+        climate_scepticism) |>
+    count() |>
+    ungroup() |>
+    # reverse key some concepts
+    relocate(unique(media_display_text$x)) |>
+    gather_set_data(1:4) |>
+    mutate(y_english = ifelse(y, "yes", "no")) |>
+    left_join(media_display_text, by = c("x", "y_english")) |>
+    mutate(y_text = str_replace_all(y_text, "_", " ")) |>
+    mutate(y_text = str_to_sentence(y_text)) |>
+    mutate(y_text = str_wrap(y_text, width = 12)) |>
+    group_by(x, y) |>
+    mutate(n_total = sum(n)) |>
+    mutate(y_text = str_c(y_text, "\n(", n_total , " articles)")) |>    
+    ungroup() |>
+    mutate(y_text = fct_reorder(y_text, y_order))
+fig_para <- data_media_stream |>
+    ggplot(aes(x, id = id, split = y_text, value = n)) +
+    geom_parallel_sets(aes(fill = foregrounds_recovery), alpha = 0.7, axis.width = 0.3) +
+    geom_parallel_sets_axes(axis.width = 0.5, fill = palette_off_white, colour = "#bababa",) +
+    geom_parallel_sets_labels(angle = 0, colour = 'black', size = 3) +
+    theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none",
+        plot.margin = margin(0, 0, 0, 0, "points")) +
+    scale_y_continuous(
+        expand = c(0, 0)) +
+    scale_fill_manual(values = palette_gray_two)  
+fig_para
+```
+
+```{r}
+# table
+# List most frequent stems in each topic
+stems <- data_words |>
+    mutate(stem = SnowballC::wordStem(word)) |>
+    group_by(stem) |>
+    # Preprocess words
+    mutate(word = ifelse(is_hyperlink, "{hyperlink}", word)) |>
+    # Get most frequent word for each stem in each topic
+    count(word) |>
+    slice_max(n, n = 1) |>
+    select(-n) |>
+    ungroup()
+keywords <- labelTopics(stm_results, n = 10)$frex |>
+    as_tibble(rownames = "topic") |>
+    pivot_longer(
+        cols = -topic,
+        names_to = "rank",
+        values_to = "stem"
+    ) |>
+    mutate(rank = as.numeric(str_replace_all(rank, "V", ""))) |>
+    mutate(topic = as.numeric(topic)) |>
+    left_join(stems, by = c("stem")) |>
+    mutate(word = ifelse(is.na(word), stem, word)) |>
+    select(topic, word) |>
+    group_by(topic) |>
+    summarise(
+        keywords = str_c(word, collapse = ", "),
+    )
+
+examples <- tibble(
+    topic = 1:stm_results$settings$dim$K,
+    tweet_id = c(
+        "1564931722172588036",
+        "1559872254258941952",
+        "1555068237712601088",
+        "1556186594322911232",
+        "1564273166129631233",
+        "1559365238058733568",
+        "1563330543722577925",
+        "1556726714809688073",
+        "1556890918502174721",
+        "1556657557334380545",
+        "1555099271044685825",
+        "1559709976201146369",
+        "1563604940287016960",
+        "1564944112574689280"
+    )) |>
+    left_join(select(data_twitter, tweet_id, text), by = "tweet_id") |>
+    mutate(text = clean_tweets(text)) |>
+    rowwise() |>
+    mutate(text = trimws(text)) |>
+    ungroup()
+
+# Topic categories
+coral_coverage_topics <- c(1, 3, 5, 7, 12)
+topics <- tibble(topic = seq(1, 14)) |>
+    mutate(is_coral_coverage = !(topic %in% c(1, 3, 5, 7, 12))) |>
+    mutate(is_sceptic = topic %in% c(2, 8, 10, 14))
+
+# Calculate percentages
+data_twitter |>
+    select(tweet_id, matches("topic_prop_[0-9]+")) |>
+    pivot_longer(
+        cols = -tweet_id,
+        names_to = "topic",
+        values_to = "prop"
+    ) |>
+    mutate(topic = str_replace_all(topic, "topic_prop_", "")) |>
+    mutate(topic = as.numeric(topic)) |>
+    group_by(topic) |>
+    summarise(
+        prop = mean(prop, na.rm = T)
+    ) |>
+    mutate(per = prop * 100) |>
+    left_join(topics, by = "topic") |>
+    left_join(keywords, by = "topic") |>
+    left_join(examples, by = "topic")  |>
+    arrange(desc(is_coral_coverage), desc(is_sceptic), desc(per)) |>
+    mutate(topic = factor(
+        topic,
+        levels = topic
+    )) |>
+    select(is_coral_coverage, is_sceptic, keywords, per, text) |>
+    mutate(across(where(is.logical), ~ ifelse(.x, html("&check;"), html("&cross;")))) |>
+    gt() |>
+    cols_label(
+        is_coral_coverage = "Coral coverage topic",
+        is_sceptic = "Climate change scepticism topic",
+        keywords = "Keywords",
+        per = "Average tweet proportion (%)",
+        text = "Example tweet"
+    ) |>
+    fmt_markdown(columns = where(is.character)) |>
+    fmt_number(columns = where(is.numeric), decimals = 2)
+
+```
+
+```{r}
+#| label: fig-sceptic
+#| fig-cap: The proportion of coral coverage content that is associated with climate change scepticism topics, as estimated by a generalised additive model. The shaded area represents two standard errors above and below the mean.
+data_gam <- data_twitter |>
+    mutate(topic_prop_coral = 
+        topic_prop_vul + 
+        topic_prop_sceptic + 
+        topic_prop_other
+    ) |>
+    mutate(coral_prop_sceptic = topic_prop_sceptic / topic_prop_coral)
+
+cor_stats <- data_gam |>
+    filter(!is.na(coral_prop_sceptic)) |>
+    summarise(
+        test = list(cor.test(day, coral_prop_sceptic, method = "pearson")),
+        cor = test[[1]]$estimate,
+        p = test[[1]]$p.value,
+        n = n()
+    )
+
+model_gam <- gam(
+    coral_prop_sceptic ~ s(day, bs = "tp", k = 40),
+    data = data_gam,
+    family = betar(link = "logit")
+)
+# Can be improved by adding a cyclic spline for hours
+# And by adding a ACF term
+# But as this figure is mostly for descriptive purposes, we leave it as is
+
+predictions <- tibble(day = seq(
+    min(data_twitter$day),
+    max(data_twitter$day),
+    length.out = 500
+))
+predictions <- predictions |>
+    mutate(preds = list(predict(model_gam, newdata = predictions, se.fit = TRUE))) |>
+    mutate(logit = preds[[1]]$fit) |>
+    mutate(se = preds[[1]]$se.fit) |>
+    mutate(proportion_upper = exp(logit + 2 * se) / (1 + exp(logit + 2 * se))) |>
+    mutate(proportion_lower = exp(logit - 2 * se) / (1 + exp(logit - 2 * se))) |>
+    mutate(proportion = exp(logit) / (1 + exp(logit))) |>
+    mutate(percentage = proportion * 100) |>
+    mutate(percentage_upper = proportion_upper * 100) |>
+    mutate(percentage_lower = proportion_lower * 100)
+
+fig_sceptical <- predictions  |>
+    ggplot(aes(x = day, y = percentage)) +
+    # Geom
+    geom_ribbon(aes(ymin = percentage_lower, ymax = percentage_upper), alpha = 0.2) +
+    geom_line(linetype = "solid", linewidth = 1) +
+    # Scale
+    scale_x_continuous(
+        breaks = ~ seq(0, max(.x), 1),
+        limits = ~ c(0, ceiling(max(.x))),
+        labels = ~ case_when(
+            .x %% 2 == 0 ~ as.character(.x),
+            TRUE ~ ""
+        ),
+        expand = expansion(mult = c(0.05, 0))
+    ) +
+    scale_y_continuous(
+        breaks = ~ seq(20, ceiling(80 / 10) * 10, by = 10),
+        limits = ~ c(20, ceiling(80 / 10) * 10),
+        labels = ~ paste0(.x, "%"),
+        expand = expansion(mult = c(0, 0))) +
+    xlab("Time (days since coral coverage report was published)") +
+    ylab(str_wrap("Proportion of coral coverage content associated with climate scepticism", 20)) +
+    coord_cartesian(clip = "off") +
+    theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey"),
+        axis.text = element_text(colour = "black", size = 11),
+        axis.title = element_text(size = 13, face = "bold"),
+        axis.title.y = element_text(vjust = 0.5, angle = 0),
+        axis.ticks = element_line(colour = "grey"),
+        panel.background = element_blank(),
+        legend.justification = "bottom",
+        legend.title = element_blank(),
+        plot.margin = margin(30, 50, 0, 0, "points"))
+fig_sceptical
+```
+
+```{r}
+#| label: fig-time
+#| fig-cap: Daily moving average of Great Barrier Reef tweets. Average was not computed for the first twelve and final twelve hours of data.
+
+# Tweets over time
+
+# Data for plotting
+data_twitter_time <- data_twitter |>
+    mutate(case = "Unique tweets and retweets") |>
+    mutate(case_order = 1) |>
+    add_case(filter(data_twitter, !is_retweet)) |>
+    mutate(case = replace_na(case, "Unique tweets")) |>
+    mutate(case_order = replace_na(case_order, 2)) |>
+    mutate(case = fct_reorder(case, case_order))
+
+# Parameters
+y_breaks <- 1000   
+seq_breaks <- as.difftime(minutes(15))
+
+time_counts <- tibble(
+    mid_time = seq(
+        min(data_twitter_time$created_at),
+        max(data_twitter_time$created_at),
+        seq_breaks)
+    ) |>
+    mutate(end_time = mid_time + hours(12)) |>
+    mutate(start_time = mid_time - hours(12)) |>
+    rowwise() |>
+    mutate(result = list(
+        filter(
+            data_twitter_time,
+            start_time < created_at & created_at < end_time
+        ) |>
+        count(case)
+    )) |>
+    ungroup() |>
+    unnest(result) |>
+    mutate(n = case_when(
+        start_time < min(data_twitter_time$created_at) ~ NA_real_,
+        end_time > max(data_twitter_time$created_at) ~ NA_real_,
+        TRUE ~ n
+    )) |>
+    mutate(time_from_start = difftime(mid_time, min(data_twitter_time$created_at), units = "days")) |>
+    mutate(time_from_start = as.numeric(time_from_start)) 
+
+figure_time <- time_counts |>
+    ggplot(aes(x = time_from_start, y = n, colour = case, fill = case)) +
+    geom_area(position = position_identity(), linewidth = 1) +
+    scale_x_continuous(
+        breaks = ~ seq(0, max(.x), 1),
+        limits = ~ c(0, ceiling(max(.x))),
+        labels = ~ case_when(
+            .x %% 2 == 0 ~ as.character(.x),
+            TRUE ~ ""
+        ),
+        expand = expansion(mult = c(0.05, 0))
+    ) +
+    scale_y_continuous(
+        breaks = ~ seq(0, ceiling(max(.x) / y_breaks) * y_breaks, by = y_breaks),
+        limits = ~ c(0, ceiling(max(.x) / y_breaks) * y_breaks),
+        labels = ~ format(.x, big.mark = ","),
+        expand = expansion(mult = c(0, 0))) +
+    xlab("Time (days since coral coverage report was published)") +
+    ylab(str_wrap("Tweets posted (per day)", 15)) +
+    coord_cartesian(clip = "off") +
+    theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey"),
+        axis.text = element_text(colour = "black", size = 11),
+        axis.title = element_text(size = 13, face = "bold"),
+        axis.ticks = element_line(colour = "grey"),
+        axis.title.y = element_text(vjust = 0.5, angle = 0),
+        panel.background = element_blank(),
+        legend.position = c(1, 1),
+        legend.justification = c(1, 0.5),
+        legend.title = element_blank(),
+        legend.key = element_rect(colour = "white", fill = NA),
+        plot.margin = margin(30, 20, 0, 0, "points")) +
+    scale_fill_manual(values = palette_gray_two) +
+    scale_colour_manual(values = palette_gray_two_bold)
+figure_time
+```
+
+```{r}
+#| label: fig-urls
+#| fig-cap: The ten most commonly discussed websites in Great Barrier Reef tweets about the coral coverage report.
+
+url_file <- "../../out/interim/twitter_urls_top_30.csv"
+popular_urls <- read_csv(url_file)
+
+popular_urls |>
+    filter(concerns_aims_finding) |>
+    slice_max(n, n = 10)  |>
+    select(url, headline, n) |>
+    gt() |>
+    cols_label(
+        url = "Source",
+        headline = "Title of webage",
+        n = "Number of shares"
+    )
+```
+
+
+
+
+```{r}
+# Composite figure
+
+#  Thanks to: http://www.sthda.com/english/articles/24-ggpubr-publication-ready-plots/81-ggplot2-easy-way-to-mix-multiple-graphs-on-the-same-page/
+
+page_width = 21.6 - 2.54 * 2
+page_height = 27.9 - 2.54 * 2
+page_units = "cm"
+
+ggsaves <- function(plot, name, width = page_width, height = page_height, units = page_units) {
+    filenames = c(
+        paste0(name, ".svg"),
+        paste0(name, ".png")
+    )
+    sapply(filenames, function(filename) {
+        ggsave(
+            filename = filename,
+            plot = plot,
+            width = width,
+            height = height,
+            units = units
+        )
+    })
+}
+
+ggsaves(
+    plot = fig_para,
+    name = "figure_media",
+    width = page_width,
+    height = 0.5 * page_width,
+    units = page_units
+)
+ggsaves(
+    plot = figure_time,
+    name = "figure_time",
+    width = page_width,
+    height = 0.6 * page_width,
+    units = page_units
+)
+ggsaves(
+    plot = fig_sceptical,
+    name = "figure_sceptical",
+    width = page_width,
+    height = 0.6 * page_width,
+    units = page_units
+)
+```
+
+
+# Statistics reported in text
+
+```{r}
+report <- data_gam |>
+    summarise(
+        n_total = n(),
+        n_preprocessed = sum(!is.na(topic_prop_max)),
+        prop_coral_coverage_avg_per = specify_decimal(mean(topic_prop_coral, na.rm = T) * 100, 2),
+        coral_prop_sceptic_avg_per = specify_decimal(mean(coral_prop_sceptic, na.rm = T) * 100, 2),
+    )
+
+p_value_to_text <- function(p) {
+    if (p < 0.001) {
+        return("*p* < .001")
+    } else {
+        return(paste0("*p* = ", specify_decimal(p, 3)))
+    }
+}
+
+```
+
+Statistics for the results:
+
+- We collected `r report$n_total` tweets discussing the GBR in twenty nine days following the coral coverage report’s publication
+- We excluded tweets (*n* = `r report$n_total - report$n_preprocessed`, `r specify_decimal((1 - (report$n_preprocessed / report$n_total)) * 100, 2)`%) with no words related to semantic meaning (e.g., ‘the’, see methods).
+- From the remaining `r report$n_preprocessed` tweets, we found fourteen topics, nine of which reflected coral coverage discussion.
+- On average, the proportion of tweets associated with coral coverage topics was `r report$prop_coral_coverage_avg_per`%.
+
+- The proportion of coral coverage discussions associated with climate change contrarianism was calculated for each tweet, by dividing the proportion of the tweet associated with climate change scepticism topics by the proportion of the tweet associated with all coral coverage topics.
+- On average, `r report$coral_prop_sceptic_avg_per`% of coral coverage discussions were associated with climate change scepticism.
+- Climate change scepticism of coral coverage discussions increased with time (*r* = `r specify_decimal(cor_stats$cor, 2)`, `r p_value_to_text(cor_stats$p)`).
+- To explore the non-linear changes in climate change scepticism, we estimated the proportion of climate change scepticism content in coral coverage discussions as a function of the time since the coral coverage report’s publication (R-squared-adjusted = `r specify_decimal(summary(model_gam)$r.sq, 2)`), using a generalised additive model (Figure 4, see appendix for model specification).
+
+```{r}
+get_mean_of_days <- function(day_at_start, day_at_end = NULL) {
+    if (is.null(day_at_end)) {
+        day_at_end <- day_at_start + 1
+    }
+    m <- data_gam |>
+        filter(day_at_start <= day & day < day_at_end) |>
+        summarise(m = mean(coral_prop_sceptic, na.rm = T) * 100) |>
+        pull(m)
+    return(specify_decimal(m, 2))
+}
+
+get_mean_of_week <- function(week) {
+    return(get_mean_of_days(
+        day_at_start = (week - 1) * 7,
+        day_at_end = (week) * 7
+    ))
+}
+
+avg_scepticism <- data_gam |>
+    mutate(day_int = floor(day)) |>
+    group_by(day_int) |>
+    summarise(
+        n_analysed = sum(!is.na(topic_prop_coral)),
+        coral_prop_sceptic_avg_per = mean(coral_prop_sceptic, na.rm = T) * 100,
+    ) |>
+    mutate(per_analysed = n_analysed / sum(n_analysed) * 100) |>
+    mutate(per_analysed_sum = cumsum(per_analysed)) |>
+    mutate(week = ceiling((day_int + 1) / 7))
+avg_scepticism_first_day <- avg_scepticism |>
+    filter(day_int == 0) |>
+    summarise(
+        coral_prop_sceptic_avg_per = coral_prop_sceptic_avg_per,
+        per_analysed = per_analysed
+    )
+avg_scepticism_first_week <- avg_scepticism |>
+    filter(week == 1)
+avg_scepticism_second_week <- avg_scepticism |>
+    filter(week == 2)
+avg_scepticism_third_week <- avg_scepticism |>
+    filter(week == 3)
+```
+
+Mean climate change scepticism in coral coverage discussions:
+
+- First day: `r get_mean_of_days(0)`%
+- First week `r get_mean_of_week(1)`%
+- Second week `r get_mean_of_week(2)`%
+- Third week `r get_mean_of_week(3)`%
+- Between 14 to 26 days after the coral cover report: `r get_mean_of_days(14, 26)`%
+- Between 25 to 28 days after the coral cover report `r get_mean_of_days(26, 28)`%
+
+
+Generalised additive model specifications and results:
+
+- `r summary(model_gam)$method` method
+- `r specify_decimal(summary(model_gam)$edf, 2)` degrees of freedom
+- `r specify_decimal(summary(model_gam)$residual.df, 2)` residual degrees of freedom
+- `r specify_decimal(summary(model_gam)$r.sq, 2)` R-squared-adjusted

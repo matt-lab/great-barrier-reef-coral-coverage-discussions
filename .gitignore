@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.DS_Store
+.workbch
+/raw_data/*
+/study/*/data
+/data/.*_twitter.parquet
+!/raw_data/README.md

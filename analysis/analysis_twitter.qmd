@@ -1,0 +1,373 @@
+```{r}
+library(tidyverse) # data wrangling
+library(arrow) # read parquet files
+library(here) # help handle relative paths in Quarto
+library(lubridate) # handles dates
+library(tidytext)
+library(stm)
+library(xml2)
+library(broom)
+library(polite) # web ettiquette
+library(rvest) # web scraping
+library(stringi)
+
+data <- read_parquet("data/data_twitter.parquet")
+```
+
+```{r}
+# Some helpful variables
+data <- data |>
+    mutate(day = interval(min(created_at), created_at) / days(1)) |>
+    mutate(day_bin = floor(day))
+```
+
+```{r}
+# Some basic cleaning
+data <- data |>
+    rowwise() |>
+    mutate(text = 
+        xml_text(
+            read_html(
+                str_c("<x>", text, "</x>")))) |>
+    ungroup()
+```
+
+```{r}
+# Preprocessing
+# Load stop words
+data(stop_words)
+stop_words <- stop_words
+stop_words <- stop_words |>
+    add_case(word = c(
+        "great", "barrier", "reef", "reefs", "#greatbarrierreef", "gbr",
+        "marine", "institute", "australian", "science", "aims",
+        "australias", "australia"))
+# Preprocess stop words in same way as tweets
+stop_words_tweets <- stop_words |>
+    unnest_tokens("word", word, token = "tweets")
+# Find unique data
+data_unique_tweets <- data |> 
+    filter(type != "retweeted" | is.na(type)) |>
+    group_by(tweet_id) |>
+    slice(1) |>
+    ungroup() |>
+    select(-type, -tweet_id_typed)
+# Extract words from unique tweets
+data_words <- data_unique_tweets |>
+    mutate(text = str_replace_all(text, "\\n", " ")) |>
+    mutate(text = str_replace_all(text, "-", " ")) |>
+    mutate(text = str_replace_all(text, '[«»““”„‟≪≫《》〝〞〟＂″‶]', '"')) |>
+    mutate(text = str_replace_all(text, "[`ʻʼʽ٬‘’‚‛՚︐]", "'")) |>
+    mutate(text = str_replace_all(text, "[^\x01-\x7F]", " ")) |>
+    select(tweet_id, text) |>
+    unnest_tokens("word", text, token = "tweets", to_lower = FALSE, drop = FALSE)
+# Remove stop words
+data_words <- data_words |>
+    mutate(is_mention = str_detect(word, "^@")) |>
+    mutate(is_hyperlink = str_detect(word, "^https:")) |>
+    mutate(is_number = str_detect(word, "^[:digit:]+$")) |>
+    mutate(is_hashtag = str_detect(word, "^#")) |>
+    filter(!is_number) |>
+    mutate(word = str_to_lower(word)) |>
+    anti_join(stop_words_tweets, by = "word") |>
+    filter(word != "") |>
+    filter(str_detect(word, "[:alpha:]"))
+```
+
+```{r twitter-stm-prep}
+# Structural Topic Modelling preparation
+data_stm <- data_words |>
+    group_by(tweet_id) |>
+    summarise(doc_for_stm = str_c(word, collapse = " ")) |>
+    right_join(data_unique_tweets, by = "tweet_id") |>
+    filter(!is.na(doc_for_stm))
+processed <- textProcessor(data_stm$doc_for_stm,
+    metadata = data_stm,
+    lowercase = FALSE,
+    removestopwords = FALSE,
+    removenumbers = FALSE,
+    removepunctuation = FALSE)
+out <- prepDocuments(processed$documents, processed$vocab, processed$meta, lower.thresh = 3)
+docs <- out$documents
+vocab <- out$vocab
+meta <- out$meta
+```
+
+```{r}
+# Vary number of topics for Structural Topic Modelling
+if(!file.exists("out/interim/twitter_stm_search_topics.parquet")) {
+    set.seed(056713)
+    stm_search_k <- searchK(
+        documents = out$documents,
+        vocab = out$vocab,
+        prevalence =~ s(day_bin),
+        K = 2:30,
+        max.em.its = 1000,
+        data = out$meta,
+        init.type = "Spectral")
+    stm_search_k_results <- stm_search_k$results
+    write_parquet(
+        stm_search_k_results,
+        "out/interim/twitter_stm_search_topics.parquet")
+}
+stm_search_k_results <- read_parquet("out/interim/twitter_stm_search_topics.parquet")
+stm_search_k_results_diffs <- stm_search_k_results |>
+    unnest(cols = c(K, exclus, semcoh, heldout, residual, bound, lbound, em.its)) |>
+    mutate(across(
+        c(exclus, semcoh, heldout, residual, lbound),
+        ~ .x - lag(.x)
+        ))
+```
+
+```{r}
+# Check metrics of each model
+stm_search_k_results |>
+    pivot_longer(exclus:lbound, names_to = "metrics", values_to = "value") |>
+    unnest(cols = c(K, em.its, value)) |>
+    ggplot(aes(x = K, y = value)) +
+    geom_point() +
+    geom_line() +
+    geom_vline(aes(xintercept = 11)) +
+    facet_wrap("metrics", scales = "free")
+```
+
+```{r}
+# Choose topics
+stm_k <- 14
+```
+
+```{r}
+if(!file.exists("out/interim/twitter_stm_results.rds")) {
+    stm_results <- stm(
+        documents = out$documents,
+        vocab = out$vocab,
+        prevalence =~ s(day),
+        K = stm_k,
+        max.em.its = 1000,
+        data = out$meta,
+        init.type = "Spectral")
+    saveRDS(stm_results, file = "out/interim/twitter_stm_results.rds")
+} else {
+    stm_results <- readRDS("out/interim/twitter_stm_results.rds")
+}
+```
+
+
+
+```{r}
+# Process results
+colnames(stm_results$theta) <- str_c("topic_prop_", 1:stm_k)
+# Identify theta for each unique tweet
+results_theta <- stm_results$theta |>
+    as_tibble() |>
+    mutate(topic_max = max.col(stm_results$theta)) |>
+    mutate(topic_prop_max = apply(stm_results$theta, 1, max)) |>
+    mutate(topic_main = ifelse(topic_prop_max < .50, NA, topic_max)) |>
+    mutate(tweet_id = out$meta$tweet_id)
+# Identify theta for each retweet
+results_theta_retweets <- data |>
+    select(tweet_id, type, tweet_id_typed) |>
+    filter(type == "retweeted") |>
+    left_join(results_theta, by = c("tweet_id_typed" = "tweet_id")) |>
+    select(-type, -tweet_id_typed)
+# Gather all thetas
+results_theta_all <- results_theta |>
+    add_case(results_theta_retweets)
+# Add theta information to data
+data <- data |>
+    left_join(results_theta_all, by = "tweet_id")
+```
+
+```{r}
+# A good topic model will divide the corpus into manageable chunks
+# Examine the distribution of main topics
+results_theta |>
+    ggplot(aes(x = topic_max, y = topic_prop_max, group = topic_max)) +
+    geom_boxplot(alpha = 0.3) +
+    geom_hline(yintercept = 0.25) +
+    theme(legend.position = "none")
+# For k = 22, many main topics have mean main topic proportions < .25, suggesting
+# much model uncertainty in assigning topics.
+
+# For k = 21, 4 topics < .25
+```
+
+
+
+```{r}
+# Topics and summaries:
+# 1 --- Monitoring and science of the GBR
+# 2 --- Sceptical bleach discussions
+# 3 --- Clive Palmer's proposed coal mine
+# 4 --- Climate change and the GBR
+# 5 --- Tourism
+# 6 --- Some scpetical but with discussion of Dell
+# 7 --- Tourism
+# 8 --- Sceptical about link between GBR and climate change
+# 9 --- AIMS report
+# 10 --- Peter Ridd
+# 11 --- Coral remains vulnerable
+# 12 --- #wapol, bots, etc.
+# 13 --- Conversational (e.g., starfish)
+# 14 --- Sceptical of climate change consequences
+# Not related to aims research are topics: 1, 3, 5, 7, 12
+# Sceptical: 2, 8, 10, 14
+# Other [* is directly related]: 4 [exclude because adjacent], 11*, 9*, 13 [exclude because conversational], 6 [exclude because imprecise]
+ ```
+
+
+```{r}
+# Explore all topics
+clean_tweets <- function(text) {
+    # Clean whitespace
+    text <- text |>
+        str_replace_all("[:blank:]+", " ") |>
+        str_remove_all("^[:blank:]") |>
+        str_remove_all("[:blank:]$")
+    # Remove usernames at beginning of tweet
+    text <- text |>
+        str_remove_all("^(@[:graph:]+[:blank:]+)+") |>
+        str_replace_all("@[:graph:]+[:blank:]+", "@username ") |>
+        str_replace_all("@[:graph:]+$", "@username")
+    # Remove links
+    text <- str_replace_all(text, "https://t.co/[A-Za-z0-9]+", "")
+    return(text)
+}
+
+lapply(
+    #1:stm_k,
+    13,
+    function(k){
+        print(labelTopics(stm_results, k))
+        findThoughts(stm_results, texts = meta$text, n = 30, topics = k)$docs[[1]] |>
+            clean_tweets() |>
+            unique() |>
+            head(30) |>
+            print()
+        return()})
+```
+
+```{r}
+# Topic 13 was indeed conversational, with one of the highest proportion of replies
+data |>
+    group_by(topic_main) |>
+    summarise(
+        n_total = n_distinct(tweet_id),
+        n_conversational_reply = length(which(type == "replied_to")),
+        n_conversational_quote = length(which(type == "quoted"))) |>
+    pivot_longer(starts_with("n_conversational_")) |>
+    mutate(value_per = value/n_total*100) |> View()
+```
+
+
+```{r}
+# code meta-topics
+data <- data |>
+    mutate(topic_prop_sceptic = 
+        topic_prop_2
+        + topic_prop_8
+        + topic_prop_10
+        + topic_prop_14) |>
+    mutate(topic_prop_vul =
+        topic_prop_11 +
+        topic_prop_9) |>
+    mutate(topic_prop_other =
+        topic_prop_4
+        + topic_prop_13
+        + topic_prop_6) |>
+    mutate(topic_prop_misc = 
+        topic_prop_1
+        + topic_prop_3
+        + topic_prop_5
+        + topic_prop_7
+        + topic_prop_12)
+set.seed(12354690)
+data_topics_labelled <- data[sample(nrow(data)), ] |>
+    select(tweet_id, topic_prop_sceptic, topic_prop_vul, topic_prop_other, topic_prop_misc) |>
+    pivot_longer(-tweet_id) |>
+    filter(!is.na(value)) |>
+    group_by(tweet_id) |>
+    slice_max(value, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    mutate(topic_label = str_replace_all(name, "^topic_prop_", "")) |>
+    select(-name) |>
+    rename(topic_prop_label = value)
+data <- data |>
+    left_join(data_topics_labelled, by = "tweet_id")
+```
+
+```{r}
+# Find urls
+data_urls <- data |>
+    separate_rows(urls_external, sep = ",") |>
+    select(tweet_id, urls_external) |>
+    filter(!is.na(urls_external)) |>
+    mutate(query_to_add = ifelse(
+        str_detect(urls_external, "youtube.com"),
+        str_extract(urls_external, "[?&]v=([^&]+)"),
+        NA)) |>
+    mutate(query_to_add =  ifelse(
+        str_detect(urls_external, "ycombinator.com"),
+        str_extract(urls_external, "[?&]id=([^&]+)"),
+        query_to_add)) |>
+    mutate(urls_external_base = str_replace_all(urls_external, "\\?.+$", "")) |>
+    mutate(urls_external_base = ifelse(
+        is.na(query_to_add),
+        urls_external_base,
+        str_c(urls_external_base, query_to_add))) |>
+    mutate(urls_external_base = str_replace_all(urls_external_base, "/$", "")) |>
+    select(-query_to_add)
+```
+
+```{r}
+data_urls_counts <- data_urls |>
+    count(urls_external_base)
+data_media <- read_parquet("data/data_media.parquet")
+data_media <- data_media |>
+    left_join(data_urls_counts, by = c("url" = "urls_external_base")) |>
+    mutate(n = replace_na(n, 0))
+```
+
+```{r}
+# Sheet for manual annotation
+# Only extract articles relevant to GBR
+
+get_headline <- function(url) {
+    session <- bow(url, force = TRUE)
+    scraped <- scrape(session)
+    if (is.null(scraped)) {
+        return("")
+    }
+    headline <- scrape(session) |>
+        html_node("body") |>
+        html_nodes("h1") |>
+        html_text()
+    if (length(headline) == 0) {
+        return("")
+    }
+    if (length(headline) > 1) {
+        headline <- headline[1]
+    }
+    return(headline)
+}
+
+file_urls_popular <- "out/interim/twitter_urls_top_30.csv"
+if(!file.exists(file_urls_popular)) {
+    popular_urls <- data_urls_counts |>
+        top_n(30) |>
+        rowwise() |>
+        mutate(headline = get_headline(urls_external_base), .after = urls_external_base) |>
+        mutate(headline = str_replace_all(headline, "\\n", "")) |>
+        mutate(headline = str_replace_all(headline, "[:space:]+", " ")) |>
+        mutate(url = str_replace(urls_external_base, "^https://|^http://", "")) |>
+        mutate(url = str_split(str_replace(url, "^www.", ""), "/")[[1]][1]) |>
+        ungroup() |>
+        mutate(concerns_aims_finding = urls_external_base %in% data_media$url)
+    write_csv(popular_urls, file_urls_popular)
+}
+# Note that the Zero Hedge links to a Daily Sceptic article"
+```
+
+```{r}
+save.image(file = "out/interim/twitter_analysis_full.RData") 
+```

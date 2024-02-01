@@ -1,0 +1,16 @@
+```{r}
+library(tidyverse) # data wrangling
+library(arrow) # read parquet files
+library(lubridate) # handles dates
+
+
+data <- read_parquet("data/data_media.parquet")
+```
+
+
+```{r}
+# TODO: inter-rater reliability
+# write def of code
+# classify mainstream media
+save.image(file = "out/interim/media_analysis_full.RData")
+```
